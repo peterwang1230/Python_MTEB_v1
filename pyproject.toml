@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mteb-v1"
+version = "0.1.0"
+description = "MTEB-V1 Multi-Timeframe Trend Expansion Breakout Strategy"
+dependencies = [
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "backtrader",
+    "plotly",
+    "scipy",
+    "streamlit",
+    "streamlit-lightweight-charts",
+    "yfinance",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
