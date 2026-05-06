@@ -1,4 +1,184 @@
 本文件是策略產品說明書， 這是用途是給人、Codex、VS Code 專案作為產品與策略規格依據。
+
+# Current Codex Handoff
+
+這一段是給下次新對話接續用的目前實作摘要。
+
+## 目前策略方向
+
+目前程式已從原本的「箱型高點突破追價」改成「第三波推動浪起漲點」偵測。
+
+目前不是嚴格完整 Elliott Wave 自動數浪系統，而是 pivot-based Wave3 setup：
+
+- 找 L1 -> H1 -> L2
+- L1 是第一波起點低點
+- H1 是第一波高點
+- L2 是第二波回檔低點
+- L2 必須高於 L1，代表第二波沒有破第一波起點
+- L2 後價格重新轉強，視為第三波可能起漲
+- 仍需要 HTF / MTF 多頭與成交量條件配合
+
+## Buy3 定義
+
+Buy3 目前由 `StructureDetector.detect_wave3_setup_ltf()` 產生，再由 `StrategyEngine.generate_signals()` 過濾。
+
+Buy3 條件：
+
+- HTF trend 為多頭
+- MTF trend 為多頭
+- LTF 出現 Wave3 setup
+- volume condition 成立
+- 每段 Wave2 setup 只取第一個 Buy3，出場後可繼續尋找下一段 setup
+
+策略模式：
+
+- `Legacy Box Breakout`：箱型突破模式，使用原先 breakout / HL / EMA / volume 條件，並支援連續交易
+- `Original Wave3`：保留 Wave3 行為，不套用額外品質門檻
+- `Quality Filtered`：實驗模式，加入第一版品質過濾，方便逐檔比較
+
+Legacy Box Breakout 條件：
+
+- HTF trend 為多頭
+- MTF trend 為多頭
+- MTF higher low 成立
+- LTF box breakout 成立
+- LTF close above EMA
+- volume condition 成立
+- 空手時才進場；TP/SL 出場後可繼續尋找下一筆
+
+Legacy Box Breakout 出場：
+
+```text
+entry_price = LTF Close
+stop_loss = entry_price * (1 - STOP_LOSS_PCT)
+take_profit = entry_price + (entry_price - stop_loss) * LEGACY_BOX_TARGET_R_MULTIPLE
+```
+
+Quality Filtered 條件：
+
+- Buy3 收盤價必須突破或接近 H1：`Close >= H1 * (1 - WAVE3_BREAKOUT_TOLERANCE_PCT)`
+- 風報比必須達標：`risk_reward >= WAVE3_MIN_RISK_REWARD`
+- 預期漲幅必須達標：`expected_gain_pct >= WAVE3_MIN_EXPECTED_GAIN_PCT`
+
+目前預設：
+
+- `STRATEGY_MODE = "wave3"` in config；Streamlit sidebar 預設顯示 `Legacy Box Breakout` 方便比較舊策略
+- `LEGACY_BOX_TARGET_R_MULTIPLE = 2.0`
+- `WAVE3_USE_QUALITY_FILTERS = False`
+- `WAVE3_BREAKOUT_TOLERANCE_PCT = 0.005`
+- `WAVE3_MIN_RISK_REWARD = 1.5`
+- `WAVE3_MIN_EXPECTED_GAIN_PCT = 2.0`
+
+圖上的 `Buy3 (price)`：
+
+- marker 標在哪根 K 棒下方，那根 K 棒就是 Buy3 K 棒
+- 括號裡的 price 是該根 Buy3 K 棒的收盤價，也就是 `entry_price`
+
+## 停損停利
+
+目前停損停利公式：
+
+```text
+wave1_length = H1 - L1
+stop_loss = L2 * (1 - WAVE3_STOP_BUFFER_PCT)
+take_profit = L2 + wave1_length * WAVE3_TARGET_EXTENSION
+```
+
+目前參數在 `src/mteb_v1/config.py`：
+
+- `WAVE3_REBOUND_LOOKBACK = 3`
+- `WAVE3_TARGET_EXTENSION = 1.618`
+- `WAVE3_STOP_BUFFER_PCT = 0.005`
+- `LEGACY_BOX_TARGET_R_MULTIPLE = 2.0`
+- `WAVE3_USE_QUALITY_FILTERS = False`
+- `WAVE3_BREAKOUT_TOLERANCE_PCT = 0.005`
+- `WAVE3_MIN_RISK_REWARD = 1.5`
+- `WAVE3_MIN_EXPECTED_GAIN_PCT = 2.0`
+
+圖上：
+
+- 紅色水平虛線是 stop loss
+- 綠色水平虛線是 take profit
+- 停損 / 停利圖層目前取最新一筆 Buy3 的水平價格，從 Buy3 K 棒延伸到最新 K 棒
+- 圖表同時打開 Lightweight Charts 的 `priceLineVisible`，即使線段很短或 Buy3 靠近右側，也會顯示整張圖可見的水平價位線
+- 若 Buy3 後 `Low <= stop_loss`，出場原因是 `SL`
+- 若 Buy3 後 `High >= take_profit`，出場原因是 `TP`
+- 策略目前支援多筆交易循環：空手找 Buy3、持倉等 TP/SL、出場後繼續找下一筆
+- 圖表會標示出場 marker：`TP (price)` 或 `SL (price)`
+- Streamlit 會顯示 Trade History，將每筆 Entry / Exit 成對列出，勝率統計以這些完成交易為基礎
+
+## 2026-05-05 bug 記錄：2330 停損停利線與刷新 Symbol
+
+### 病因
+
+1. `Symbol` sidebar input 原本使用固定預設 `value="AAPL"`。Streamlit 按鈕、重新整理、widget rerun 都會重新執行 script；若 Symbol 沒有被明確綁到 `st.session_state` 或 URL query param，就容易回到 AAPL。
+2. 停損 / 停利線原本只用第一筆 entry 的 level，並延伸到第一個 exit。對 2330.TW 這種已經大幅走過 Buy3 的資料，線段可能很短、位置偏左，甚至被 hover-card 或可視比例影響，看起來像沒有停損停利線。
+
+### 修法
+
+1. `app/streamlit_app.py` 將 Symbol 改成 `key="symbol_input"`，並同步到 `st.query_params["symbol"]`。刷新頁面會從 URL query param 還原 Symbol，因此 `2330` 不會自動跳回 AAPL。
+2. `src/mteb_v1/streamlit_charts.py::signal_level_to_line()` 改成取最新一筆 Buy3 的 `stop_loss` / `take_profit`，並延伸到最新 K 棒。
+3. `app/streamlit_app.py` 的 stop / target line series 開啟 `priceLineVisible`，讓紅色停損、綠色停利水平價位即使在特殊縮放下仍可見。
+
+### 驗證
+
+測試必須使用專案 `.venv`：
+
+```bash
+.venv/bin/python -m pytest tests/test_strategy.py tests/test_structure.py tests/test_streamlit_charts.py
+```
+
+2026-05-05 結果：`23 passed in 10.16s`。
+
+## UI 目前狀態
+
+Streamlit app：
+
+- 主要檔案是 `app/streamlit_app.py`
+- cursor hover 顯示 Open / Close / Volume / Upper wick / Lower wick
+- hover-card 有 `pointer-events: none`，避免擋住滑鼠 crosshair
+- Latest 表格顯示 Entry / Stop / Target / Expected Gain / R/R / Exit / Last Buy3
+- Latest metrics 顯示 Entries / Closed / Open / Wins / Losses / Win Rate；勝率只用 Closed 交易計算
+- Trade History 表格顯示 Entry Time / Entry Price / Stop / Target / Exit Time / Exit Price / Result
+- 因為 Streamlit 熱重載可能留住舊 module，app 目前會 reload `config` / `streamlit_charts` / `structure` / `strategy`
+- Symbol 會同步到 session state 與 URL query param，重新整理後保留目前標的
+
+## 測試方式
+
+本專案虛擬環境在 `.venv`。
+
+跑測試請用：
+
+```bash
+.venv/bin/python -m pytest
+```
+
+最近一次相關測試：
+
+```bash
+.venv/bin/python -m pytest tests/test_strategy.py tests/test_streamlit_charts.py tests/test_structure.py tests/test_backtest.py
+```
+
+結果是 35 passed。
+
+## 後續想做
+
+下一步希望加入 Buy3 評分制，目前尚未實作。
+
+建議 100 分制：
+
+- 趨勢分：HTF / MTF 多頭
+- 波型分：L1-H1-L2 結構品質
+- Fibonacci 分：L2 回檔比例、Wave3 extension 合理性
+- 成交量分：是否明顯放量
+- 風報比分：R/R 是否足夠
+
+可考慮：
+
+- Score >= 75 顯示 Buy3
+- Score 60-74 顯示 Watch3
+- Score < 60 不顯示訊號
+
 # Contents
 1. 策略定位
 2. 策略名稱

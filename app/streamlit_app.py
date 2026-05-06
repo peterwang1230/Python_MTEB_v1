@@ -15,13 +15,16 @@ SRC_PATH = PROJECT_ROOT / "src"
 if str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
-from mteb_v1.config import Config
 from mteb_v1.data_loader import DataLoader
-from mteb_v1.strategy import StrategyEngine
-from mteb_v1 import streamlit_charts
-from mteb_v1.structure import StructureDetector
+from mteb_v1 import config, streamlit_charts, strategy, structure
 
+config = importlib.reload(config)
 streamlit_charts = importlib.reload(streamlit_charts)
+structure = importlib.reload(structure)
+strategy = importlib.reload(strategy)
+Config = config.Config
+StructureDetector = structure.StructureDetector
+StrategyEngine = strategy.StrategyEngine
 
 
 st.set_page_config(
@@ -202,17 +205,18 @@ def last_flag(series: pd.Series) -> str:
 
 
 def condition_snapshot(detector: StructureDetector) -> dict[str, str]:
+    wave3 = detector.detect_wave3_setup_ltf()
     return {
         "HTF": last_flag(detector.detect_trend_htf()),
         "MTF": last_flag(detector.detect_trend_mtf()),
         "HL": last_flag(detector.detect_hl_mtf()),
-        "Breakout": last_flag(detector.detect_box_breakout_ltf()[0]),
+        "Wave3": last_flag(wave3["wave3_setup"]),
         "Volume": last_flag(detector.volume_condition_ltf()),
     }
 
 
 def status_class(value: str) -> str:
-    if value in {"ON", "BUY-3"}:
+    if value in {"ON", "Buy3"}:
         return "ok"
     if value in {"WAIT", "NO DATA"}:
         return "wait"
@@ -225,7 +229,7 @@ def render_status(symbol: str, snapshot: dict[str, str], state: dict[str, str]) 
         ("HTF trend", snapshot.get("HTF", "WAIT")),
         ("MTF trend", snapshot.get("MTF", "WAIT")),
         ("Higher low", snapshot.get("HL", "WAIT")),
-        ("Breakout", snapshot.get("Breakout", "WAIT")),
+        ("Wave3 setup", snapshot.get("Wave3", "WAIT")),
         ("Signal", state["entry"]),
     ]
     html = ['<div class="status-strip">']
@@ -250,6 +254,7 @@ def render_interactive_chart(df: pd.DataFrame, signals: pd.DataFrame, key: str) 
                 <div class="hover-grid">
                     <span>Open</span><strong id="hover-open-{key}">-</strong>
                     <span>Close</span><strong id="hover-close-{key}">-</strong>
+                    <span>Volume</span><strong id="hover-volume-{key}">-</strong>
                     <span>Upper wick</span><strong id="hover-upper-{key}">-</strong>
                     <span>Lower wick</span><strong id="hover-lower-{key}">-</strong>
                 </div>
@@ -263,6 +268,9 @@ def render_interactive_chart(df: pd.DataFrame, signals: pd.DataFrame, key: str) 
         const container = document.getElementById("chart-{key}");
         const hoverRows = new Map(payload.hoverRows.map(row => [row.time, row]));
         const fmt = value => Number(value).toFixed(2);
+        const fmtVolume = value => new Intl.NumberFormat("en-US", {{
+            maximumFractionDigits: 0,
+        }}).format(Number(value));
 
         const chart = LightweightCharts.createChart(container, {{
             height: 640,
@@ -310,6 +318,28 @@ def render_interactive_chart(df: pd.DataFrame, signals: pd.DataFrame, key: str) 
         }});
         boxSeries.setData(payload.boxHigh);
 
+        const stopSeries = chart.addLineSeries({{
+            color: "#ef5350",
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            priceLineVisible: true,
+            priceLineColor: "#ef5350",
+            priceLineStyle: LightweightCharts.LineStyle.Dashed,
+            lastValueVisible: true,
+        }});
+        stopSeries.setData(payload.stopLoss);
+
+        const targetSeries = chart.addLineSeries({{
+            color: "#26a69a",
+            lineWidth: 2,
+            lineStyle: LightweightCharts.LineStyle.Dashed,
+            priceLineVisible: true,
+            priceLineColor: "#26a69a",
+            priceLineStyle: LightweightCharts.LineStyle.Dashed,
+            lastValueVisible: true,
+        }});
+        targetSeries.setData(payload.takeProfit);
+
         const waveSeries = chart.addLineSeries({{
             color: "#b9c5d8",
             lineWidth: 2,
@@ -332,6 +362,7 @@ def render_interactive_chart(df: pd.DataFrame, signals: pd.DataFrame, key: str) 
             document.getElementById("hover-date-{key}").textContent = row.label;
             document.getElementById("hover-open-{key}").textContent = fmt(row.open);
             document.getElementById("hover-close-{key}").textContent = fmt(row.close);
+            document.getElementById("hover-volume-{key}").textContent = fmtVolume(row.volume);
             document.getElementById("hover-upper-{key}").textContent =
                 fmt(row.high) + " / " + fmt(row.upperWick);
             document.getElementById("hover-lower-{key}").textContent =
@@ -376,6 +407,7 @@ def render_interactive_chart(df: pd.DataFrame, signals: pd.DataFrame, key: str) 
             z-index: 5;
             top: 12px;
             left: 12px;
+            pointer-events: none;
             min-width: 300px;
             padding: 0.7rem 0.78rem;
             background: rgba(9, 13, 19, 0.84);
@@ -424,24 +456,58 @@ def render_interactive_chart(df: pd.DataFrame, signals: pd.DataFrame, key: str) 
     )
 
 
+def query_param_value(name: str, default: str) -> str:
+    value = st.query_params.get(name, default)
+    if isinstance(value, list):
+        return str(value[0]) if value else default
+    return str(value)
+
+
 def main() -> None:
     apply_style()
 
+    default_symbol = query_param_value("symbol", "AAPL").strip().upper() or "AAPL"
+    if "symbol_input" not in st.session_state:
+        st.session_state.symbol_input = default_symbol
+
     with st.sidebar:
         st.title("MTEB-V1")
-        symbol = st.text_input("Symbol", value="AAPL").strip().upper()
+        symbol = st.text_input("Symbol", key="symbol_input").strip().upper()
+        if symbol and query_param_value("symbol", "") != symbol:
+            st.query_params["symbol"] = symbol
         period = st.selectbox("History", ["5d", "1mo"], index=1)
         prepost = st.toggle("Pre/Post market", value=False)
         st.caption("Yahoo 15m intraday data is limited; use 1mo or shorter for reliable loading.")
 
         st.divider()
         st.subheader("Strategy")
+        strategy_mode = st.selectbox(
+            "Mode",
+            ["Legacy Box Breakout", "Original Wave3", "Quality Filtered"],
+            index=0,
+        )
+        if strategy_mode == "Legacy Box Breakout":
+            Config.STRATEGY_MODE = "legacy_box"
+            Config.WAVE3_USE_QUALITY_FILTERS = False
+        elif strategy_mode == "Quality Filtered":
+            Config.STRATEGY_MODE = "quality_wave3"
+            Config.WAVE3_USE_QUALITY_FILTERS = True
+        else:
+            Config.STRATEGY_MODE = "wave3"
+            Config.WAVE3_USE_QUALITY_FILTERS = False
         st.write(f"HTF: `{Config.HTF}`")
         st.write(f"MTF: `{Config.MTF}`")
         st.write(f"LTF: `{Config.LTF}`")
         st.write(f"EMA: `{Config.EMA_PERIOD}`")
         st.write(f"Box: `{Config.BOX_PERIOD}`")
         st.write(f"Volume x: `{Config.VOLUME_MULTIPLIER}`")
+        if Config.STRATEGY_MODE == "legacy_box":
+            st.write(f"Target R: `{Config.LEGACY_BOX_TARGET_R_MULTIPLE}`")
+            st.write(f"Stop: `{Config.STOP_LOSS_PCT:.1%}`")
+        elif Config.WAVE3_USE_QUALITY_FILTERS:
+            st.write(f"Near H1: `{Config.WAVE3_BREAKOUT_TOLERANCE_PCT:.1%}`")
+            st.write(f"Min R/R: `{Config.WAVE3_MIN_RISK_REWARD}`")
+            st.write(f"Min Gain: `{Config.WAVE3_MIN_EXPECTED_GAIN_PCT:.1f}%`")
 
     st.markdown(
         f"""
@@ -471,13 +537,16 @@ def main() -> None:
 
     try:
         detector = StructureDetector(data)
-        signals = StrategyEngine(detector).generate_signals()
+        engine = StrategyEngine(detector)
+        signals = engine.generate_signals()
+        performance = engine.summarize_performance(signals)
         snapshot = condition_snapshot(detector)
     except Exception as exc:
         st.error(f"Unable to evaluate strategy: {exc}")
         return
 
     state = streamlit_charts.latest_strategy_state(signals)
+    trades = streamlit_charts.trade_history(signals)
     render_status(resolved_symbol, snapshot, state)
 
     chart_key = f"{resolved_symbol}-{period}-{prepost}".replace(".", "-").replace("_", "-")
@@ -486,6 +555,14 @@ def main() -> None:
     left, right = st.columns([1, 1])
     with left:
         st.subheader("Latest")
+        win_rate = performance["win_rate"]
+        metric_cols = st.columns(6)
+        metric_cols[0].metric("Entries", performance["entries"])
+        metric_cols[1].metric("Closed", performance["completed_trades"])
+        metric_cols[2].metric("Open", performance["open_trades"])
+        metric_cols[3].metric("Wins", performance["wins"])
+        metric_cols[4].metric("Losses", performance["losses"])
+        metric_cols[5].metric("Win Rate", f"{win_rate:.1%}" if win_rate is not None else "-")
         latest_bar = data["LTF"].iloc[-1]
         st.dataframe(
             pd.DataFrame(
@@ -493,8 +570,14 @@ def main() -> None:
                     {
                         "Close": round(float(latest_bar["Close"]), 2),
                         "Volume": int(latest_bar["Volume"]),
-                        "Box High": state["box_high"],
-                        "Last BUY-3": state["last_signal_time"],
+                        "Entry": state["entry_price"],
+                        "Stop": state["stop_loss"],
+                        "Target": state["take_profit"],
+                        "Expected Gain": state["expected_gain_pct"],
+                        "R/R": state["risk_reward"],
+                        "Exit": state["exit_reason"],
+                        "Last Buy3": state["last_signal_time"],
+                        "Open Trades": performance["open_trades"],
                     }
                 ]
             ),
@@ -503,6 +586,28 @@ def main() -> None:
         )
 
     with right:
+        st.subheader("Trade History")
+        if trades.empty:
+            st.info("No trades generated for the loaded history.")
+        else:
+            display_trades = trades.copy().sort_values("Entry Time", ascending=False)
+            for column in ["Entry Time", "Exit Time"]:
+                display_trades[column] = display_trades[column].apply(
+                    lambda value: "-" if pd.isna(value) else str(value)
+                )
+            for column in ["Entry Price", "Stop", "Target", "Exit Price", "R/R"]:
+                display_trades[column] = display_trades[column].apply(
+                    lambda value: "-" if pd.isna(value) else f"{float(value):.2f}"
+                )
+            display_trades["Expected Gain"] = display_trades["Expected Gain"].apply(
+                lambda value: "-" if pd.isna(value) else f"{float(value):.2f}%"
+            )
+            st.dataframe(
+                display_trades,
+                hide_index=True,
+                use_container_width=True,
+            )
+
         st.subheader("Signals")
         st.dataframe(
             signals.tail(25).sort_index(ascending=False),

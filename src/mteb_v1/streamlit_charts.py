@@ -62,6 +62,7 @@ def ohlcv_to_hover_rows(df: pd.DataFrame) -> List[Dict[str, float | int | str]]:
                 "high": high,
                 "low": low,
                 "close": close,
+                "volume": float(row["Volume"]),
                 "upperWick": high - body_high,
                 "lowerWick": body_low - low,
             }
@@ -94,15 +95,99 @@ def signals_to_markers(df: pd.DataFrame, signals: pd.DataFrame) -> List[Dict[str
     for index in entries.index:
         if index not in df.index:
             continue
+        entry_price = entries.loc[index].get("entry_price")
+        if pd.isna(entry_price):
+            entry_price = df.loc[index, "Close"]
         markers.append(
             {
                 "time": _chart_time(index),
                 "position": "belowBar",
                 "color": COLOR_BULL,
                 "shape": "arrowUp",
-                "text": "BUY-3",
+                "text": f"Buy3 ({float(entry_price):.2f})",
             }
         )
+    return markers
+
+
+def trade_history(signals: pd.DataFrame) -> pd.DataFrame:
+    """Pair entries and exits into a compact trade ledger."""
+    columns = [
+        "Entry Time",
+        "Entry Price",
+        "Stop",
+        "Target",
+        "Expected Gain",
+        "R/R",
+        "Exit Time",
+        "Exit Price",
+        "Result",
+    ]
+    if signals.empty or "entry" not in signals:
+        return pd.DataFrame(columns=columns)
+
+    trades = []
+    active_trade = None
+    for index, row in signals.iterrows():
+        if int(row.get("entry", 0)) == 1:
+            active_trade = {
+                "Entry Time": index,
+                "Entry Price": row.get("entry_price"),
+                "Stop": row.get("stop_loss"),
+                "Target": row.get("take_profit"),
+                "Expected Gain": row.get("expected_gain_pct"),
+                "R/R": row.get("risk_reward"),
+                "Exit Time": pd.NA,
+                "Exit Price": pd.NA,
+                "Result": "OPEN",
+            }
+            continue
+
+        if active_trade is None or not bool(row.get("exit", False)):
+            continue
+
+        result = str(row.get("exit_reason"))
+        active_trade["Exit Time"] = index
+        active_trade["Result"] = result
+        if result == "TP":
+            active_trade["Exit Price"] = active_trade["Target"]
+        elif result == "SL":
+            active_trade["Exit Price"] = active_trade["Stop"]
+        trades.append(active_trade)
+        active_trade = None
+
+    if active_trade is not None:
+        trades.append(active_trade)
+
+    return pd.DataFrame(trades, columns=columns)
+
+
+def exit_signals_to_markers(df: pd.DataFrame, signals: pd.DataFrame) -> List[Dict[str, str | int]]:
+    """Build TP/SL markers from paired trade exits."""
+    markers = []
+    trades = trade_history(signals)
+    if trades.empty:
+        return markers
+
+    for _, trade in trades.iterrows():
+        exit_time = trade["Exit Time"]
+        result = trade["Result"]
+        if pd.isna(exit_time) or result not in {"TP", "SL"} or exit_time not in df.index:
+            continue
+
+        is_win = result == "TP"
+        exit_price = trade["Exit Price"]
+        price_text = f" ({float(exit_price):.2f})" if pd.notna(exit_price) else ""
+        markers.append(
+            {
+                "time": _chart_time(exit_time),
+                "position": "aboveBar",
+                "color": COLOR_BULL if is_win else COLOR_BEAR,
+                "shape": "arrowDown",
+                "text": f"{result}{price_text}",
+            }
+        )
+
     return markers
 
 
@@ -119,6 +204,24 @@ def box_high_to_line(signals: pd.DataFrame) -> List[Dict[str, float]]:
         }
         for index, value in series.items()
     ]
+
+
+def signal_level_to_line(signals: pd.DataFrame, column: str) -> List[Dict[str, float]]:
+    """Extend the latest entry level through the latest chart bar."""
+    if signals.empty or "entry" not in signals or column not in signals:
+        return []
+
+    entries = signals[(signals["entry"] == 1) & signals[column].notna()]
+    if entries.empty:
+        return []
+
+    entry_index = entries.index[-1]
+    last_index = signals.index[-1]
+    value = float(entries.iloc[-1][column])
+    points = [{"time": _chart_time(entry_index), "value": value}]
+    if entry_index != last_index:
+        points.append({"time": _chart_time(last_index), "value": value})
+    return points
 
 
 def pivot_wave_points(df: pd.DataFrame, window: int = Config.PIVOT_WINDOW) -> List[Dict[str, float | str]]:
@@ -193,6 +296,16 @@ def pivot_wave_to_markers(wave_points: List[Dict[str, float | str]]) -> List[Dic
     return markers
 
 
+def chart_markers(df: pd.DataFrame, signals: pd.DataFrame, wave_points: List[Dict[str, float | str]]) -> List[Dict[str, str | int]]:
+    """Build all chart markers in chronological order for stable rendering."""
+    markers = (
+        signals_to_markers(df, signals) +
+        exit_signals_to_markers(df, signals) +
+        pivot_wave_to_markers(wave_points)
+    )
+    return sorted(markers, key=lambda marker: int(marker["time"]))
+
+
 def build_price_volume_chart(df: pd.DataFrame, signals: pd.DataFrame) -> List[Dict]:
     """Build the chart payload consumed by streamlit-lightweight-charts."""
     wave_points = pivot_wave_points(df)
@@ -206,7 +319,7 @@ def build_price_volume_chart(df: pd.DataFrame, signals: pd.DataFrame) -> List[Di
             "wickUpColor": COLOR_BULL,
             "wickDownColor": COLOR_BEAR,
         },
-        "markers": signals_to_markers(df, signals) + pivot_wave_to_markers(wave_points),
+        "markers": chart_markers(df, signals, wave_points),
     }
 
     box_high_series = {
@@ -290,8 +403,10 @@ def build_interactive_chart_payload(df: pd.DataFrame, signals: pd.DataFrame) -> 
         "candles": ohlcv_to_candles(df),
         "volume": ohlcv_to_volume(df),
         "boxHigh": box_high_to_line(signals),
+        "stopLoss": signal_level_to_line(signals, "stop_loss"),
+        "takeProfit": signal_level_to_line(signals, "take_profit"),
         "wave": pivot_wave_to_line(wave_points),
-        "markers": signals_to_markers(df, signals) + pivot_wave_to_markers(wave_points),
+        "markers": chart_markers(df, signals, wave_points),
         "hoverRows": ohlcv_to_hover_rows(df),
     }
 
@@ -303,14 +418,41 @@ def latest_strategy_state(signals: pd.DataFrame) -> Dict[str, str]:
             "entry": "NO DATA",
             "box_high": "-",
             "last_signal_time": "-",
+            "entry_price": "-",
+            "stop_loss": "-",
+            "take_profit": "-",
+            "expected_gain_pct": "-",
+            "risk_reward": "-",
+            "exit_reason": "-",
         }
 
     latest = signals.iloc[-1]
     entries = signals[signals["entry"] == 1] if "entry" in signals else pd.DataFrame()
+    trades = trade_history(signals)
+    latest_trade = trades.iloc[-1] if not trades.empty else pd.Series(dtype=object)
+    exit_reason = latest_trade.get("Result", "-") if not trades.empty else "-"
+    if exit_reason == "OPEN":
+        exit_reason = "-"
     return {
-        "entry": "BUY-3" if int(latest.get("entry", 0)) == 1 else "WAIT",
+        "entry": "Buy3" if int(latest.get("entry", 0)) == 1 else "WAIT",
         "box_high": f"{float(latest.get('box_high')):.2f}"
         if pd.notna(latest.get("box_high"))
         else "-",
         "last_signal_time": str(entries.index[-1]) if not entries.empty else "-",
+        "entry_price": f"{float(latest_trade.get('Entry Price')):.2f}"
+        if pd.notna(latest_trade.get("Entry Price"))
+        else "-",
+        "stop_loss": f"{float(latest_trade.get('Stop')):.2f}"
+        if pd.notna(latest_trade.get("Stop"))
+        else "-",
+        "take_profit": f"{float(latest_trade.get('Target')):.2f}"
+        if pd.notna(latest_trade.get("Target"))
+        else "-",
+        "expected_gain_pct": f"{float(latest_trade.get('Expected Gain')):.2f}%"
+        if pd.notna(latest_trade.get("Expected Gain"))
+        else "-",
+        "risk_reward": f"{float(latest_trade.get('R/R')):.2f}"
+        if pd.notna(latest_trade.get("R/R"))
+        else "-",
+        "exit_reason": str(exit_reason),
     }
